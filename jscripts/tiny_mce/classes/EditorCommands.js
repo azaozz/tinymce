@@ -23,6 +23,7 @@
 			selection = editor.selection,
 			commands = {state: {}, exec : {}, value : {}},
 			settings = editor.settings,
+			formatter = editor.formatter,
 			bookmark;
 
 		/**
@@ -118,11 +119,11 @@
 		};
 
 		function isFormatMatch(name) {
-			return editor.formatter.match(name);
+			return formatter.match(name);
 		};
 
 		function toggleFormat(name, value) {
-			editor.formatter.toggle(name, value ? {value : value} : undefined);
+			formatter.toggle(name, value ? {value : value} : undefined);
 		};
 
 		function storeSelection(type) {
@@ -182,7 +183,7 @@
 				// Remove all other alignments first
 				each('left,center,right,full'.split(','), function(name) {
 					if (align != name)
-						editor.formatter.remove('align' + name);
+						formatter.remove('align' + name);
 				});
 
 				toggleFormat('align' + align);
@@ -239,7 +240,7 @@
 			},
 
 			RemoveFormat : function(command) {
-				editor.formatter.remove(command);
+				formatter.remove(command);
 			},
 
 			mceBlockQuote : function(command) {
@@ -285,22 +286,17 @@
 			},
 
 			mceInsertContent : function(command, ui, value) {
-				var caretNode, rng, rootNode, parent, node, rng, nodeRect, viewPortRect, args;
+				var parser, serializer, parentNode, rootNode, fragment, args,
+					marker, nodeRect, viewPortRect, rng, node, node2, bookmarkHtml, viewportBodyElement;
 
-				function findSuitableCaretNode(node, root_node, next) {
-					var walker = new tinymce.dom.TreeWalker(next ? node.nextSibling : node.previousSibling, root_node);
+				//selection.normalize();
 
-					while ((node = walker.current())) {
-						if ((node.nodeType == 3 && tinymce.trim(node.nodeValue).length) || node.nodeName == 'BR' || node.nodeName == 'IMG')
-							return node;
+				// Setup parser and serializer
+				parser = editor.parser;
+				serializer = new tinymce.html.Serializer({}, editor.schema);
+				bookmarkHtml = '<span id="mce_marker" data-mce-type="bookmark">\uFEFF</span>';
 
-						if (next)
-							walker.next();
-						else
-							walker.prev();
-					}
-				};
-
+				// Run beforeSetContent handlers on the HTML to be inserted
 				args = {content: value, format: 'html'};
 				selection.onBeforeSetContent.dispatch(selection, args);
 				value = args.content;
@@ -309,89 +305,114 @@
 				if (value.indexOf('{$caret}') == -1)
 					value += '{$caret}';
 
-				// Set the content at selection to a span and replace it's contents with the value
-				selection.setContent('<span id="__mce">\uFEFF</span>', {no_events : false});
-				dom.setOuterHTML('__mce', value.replace(/\{\$caret\}/, '<span data-mce-type="bookmark" id="__mce">\uFEFF</span>'));
+				// Replace the caret marker with a span bookmark element
+				value = value.replace(/\{\$caret\}/, bookmarkHtml);
 
-				caretNode = dom.select('#__mce')[0];
-				rootNode = dom.getRoot();
+				// Insert node maker where we will insert the new HTML and get it's parent
+				if (!selection.isCollapsed())
+					editor.getDoc().execCommand('Delete', false, null);
 
-				// Move the caret into the last suitable location within the previous sibling if it's a block since the block might be split
-				if (caretNode.previousSibling && dom.isBlock(caretNode.previousSibling) || caretNode.parentNode == rootNode) {
-					node = findSuitableCaretNode(caretNode, rootNode);
-					if (node) {
-						if (node.nodeName == 'BR')
-							node.parentNode.insertBefore(caretNode, node);
-						else
-							dom.insertAfter(caretNode, node);
-					}
-				}
+				parentNode = selection.getNode();
 
-				// Find caret root parent and clean it up using the serializer to avoid nesting
-				while (caretNode) {
-					if (caretNode === rootNode) {
-						// Clean up the parent element by parsing and serializing it
-						// This will remove invalid elements/attributes and fix nesting issues
-						dom.setOuterHTML(parent, 
-							new tinymce.html.Serializer({}, editor.schema).serialize(
-								editor.parser.parse(dom.getOuterHTML(parent))
-							)
-						);
+				// Parse the fragment within the context of the parent node
+				args = {context : parentNode.nodeName.toLowerCase()};
+				fragment = parser.parse(value, args);
 
-						break;
-					}
+				// Move the caret to a more suitable location
+				node = fragment.lastChild;
+				if (node.attr('id') == 'mce_marker') {
+					marker = node;
 
-					parent = caretNode;
-					caretNode = caretNode.parentNode;
-				}
-
-				// Find caret after cleanup and move selection to that location
-				caretNode = dom.select('#__mce')[0];
-				if (caretNode) {
-					node = findSuitableCaretNode(caretNode, rootNode) || findSuitableCaretNode(caretNode, rootNode, true);
-					dom.remove(caretNode);
-
-					if (node) {
-						rng = dom.createRng();
-
-						if (node.nodeType == 3) {
-							rng.setStart(node, node.length);
-							rng.setEnd(node, node.length);
-						} else {
-							if (node.nodeName == 'BR') {
-								rng.setStartBefore(node);
-								rng.setEndBefore(node);
-							} else {
-								rng.setStartAfter(node);
-								rng.setEndAfter(node);
-							}
+					for (node = node.prev; node; node = node.walk(true)) {
+						if (node.type == 3 || !dom.isBlock(node.name)) {
+							node.parent.insert(marker, node, node.name === 'br');
+							break;
 						}
-
-						selection.setRng(rng);
-
-						// Scroll range into view scrollIntoView on element can't be used since it will scroll the main view port as well
-						if (!tinymce.isIE) {
-							node = dom.create('span', null, '\u00a0');
-							rng.insertNode(node);
-							nodeRect = dom.getRect(node);
-							viewPortRect = dom.getViewPort(editor.getWin());
-
-							// Check if node is out side the viewport if it is then scroll to it
-							if ((nodeRect.y > viewPortRect.y + viewPortRect.h || nodeRect.y < viewPortRect.y) ||
-								(nodeRect.x > viewPortRect.x + viewPortRect.w || nodeRect.x < viewPortRect.x)) {
-								editor.getBody().scrollLeft = nodeRect.x;
-								editor.getBody().scrollTop = nodeRect.y;
-							}
-
-							dom.remove(node);
-						}
-
-						// Make sure that the selection is collapsed after we removed the node fixes a WebKit bug
-						// where WebKit would place the endContainer/endOffset at a different location than the startContainer/startOffset
-						selection.collapse(true);
 					}
 				}
 
+				// If parser says valid we can insert the contents into that parent
+				if (!args.invalid) {
+					value = serializer.serialize(fragment);
+
+					// Check if parent is empty or only has one BR element then set the innerHTML of that parent
+					node = parentNode.firstChild;
+					node2 = parentNode.lastChild;
+					if (!node || (node === node2 && node.nodeName === 'BR'))
+						dom.setHTML(parentNode, value);
+					else
+						selection.setContent(value);
+				} else {
+					// If the fragment was invalid within that context then we need
+					// to parse and process the parent it's inserted into
+
+					// Insert bookmark node and get the parent
+					selection.setContent(bookmarkHtml);
+					parentNode = editor.selection.getNode();
+					rootNode = editor.getBody();
+
+					// Opera will return the document node when selection is in root
+					if (parentNode.nodeType == 9)
+						parentNode = node = rootNode;
+					else
+						node = parentNode;
+
+					// Find the ancestor just before the root element
+					while (node !== rootNode) {
+						parentNode = node;
+						node = node.parentNode;
+					}
+
+					// Get the outer/inner HTML depending on if we are in the root and parser and serialize that
+					value = parentNode == rootNode ? rootNode.innerHTML : dom.getOuterHTML(parentNode);
+					value = serializer.serialize(
+						parser.parse(
+							// Need to replace by using a function since $ in the contents would otherwise be a problem
+							value.replace(/<span (id="mce_marker"|id=mce_marker).+?<\/span>/i, function() {
+								return serializer.serialize(fragment);
+							})
+						)
+					);
+
+					// Set the inner/outer HTML depending on if we are in the root or not
+					if (parentNode == rootNode)
+						dom.setHTML(rootNode, value);
+					else
+						dom.setOuterHTML(parentNode, value);
+				}
+
+				marker = dom.get('mce_marker');
+
+				// Scroll range into view scrollIntoView on element can't be used since it will scroll the main view port as well
+				nodeRect = dom.getRect(marker);
+				viewPortRect = dom.getViewPort(editor.getWin());
+
+				// Check if node is out side the viewport if it is then scroll to it
+				if ((nodeRect.y + nodeRect.h > viewPortRect.y + viewPortRect.h || nodeRect.y < viewPortRect.y) ||
+					(nodeRect.x > viewPortRect.x + viewPortRect.w || nodeRect.x < viewPortRect.x)) {
+					viewportBodyElement = tinymce.isIE ? editor.getDoc().documentElement : editor.getBody();
+					viewportBodyElement.scrollLeft = nodeRect.x;
+					viewportBodyElement.scrollTop = nodeRect.y - viewPortRect.h + 25;
+				}
+
+				// Move selection before marker and remove it
+				rng = dom.createRng();
+
+				// If previous sibling is a text node set the selection to the end of that node
+				node = marker.previousSibling;
+				if (node && node.nodeType == 3) {
+					rng.setStart(node, node.nodeValue.length);
+				} else {
+					// If the previous sibling isn't a text node or doesn't exist set the selection before the marker node
+					rng.setStartBefore(marker);
+					rng.setEndBefore(marker);
+				}
+
+				// Remove the marker node and set the new range
+				dom.remove(marker);
+				selection.setRng(rng);
+
+				// Dispatch after event and add any visual elements needed
 				selection.onSetContent.dispatch(selection, args);
 				editor.addVisual();
 			},
@@ -444,7 +465,7 @@
 			},
 
 			mceToggleFormat : function(command, ui, value) {
-				editor.formatter.toggle(value);
+				formatter.toggle(value);
 			},
 
 			InsertHorizontalRule : function() {
@@ -461,42 +482,27 @@
 			},
 
 			mceInsertLink : function(command, ui, value) {
-				var link = dom.getParent(selection.getNode(), 'a'), img, floatVal;
+				var anchor;
 
-				if (tinymce.is(value, 'string'))
+				if (typeof(value) == 'string')
 					value = {href : value};
+
+				anchor = dom.getParent(selection.getNode(), 'a');
 
 				// Spaces are never valid in URLs and it's a very common mistake for people to make so we fix it here.
 				value.href = value.href.replace(' ', '%20');
 
-				if (!link) {
-					// WebKit can't create links on float images for some odd reason so just remove it and restore it later
-					if (tinymce.isWebKit) {
-						img = dom.getParent(selection.getNode(), 'img');
+				// Remove existing links if there could be child links or that the href isn't specified
+				if (!anchor || !value.href) {
+					formatter.remove('link');
+				}		
 
-						if (img) {
-							floatVal = img.style.cssFloat;
-							img.style.cssFloat = null;
-						}
-					}
-
-					execNativeCommand('CreateLink', FALSE, 'javascript:mctmp(0);');
-
-					// Restore float value
-					if (floatVal)
-						img.style.cssFloat = floatVal;
-
-					each(dom.select("a[href='javascript:mctmp(0);']"), function(link) {
-						dom.setAttribs(link, value);
-					});
-				} else {
-					if (value.href)
-						dom.setAttribs(link, value);
-					else
-						editor.dom.remove(link, TRUE);
+				// Apply new link to selection
+				if (value.href) {
+					formatter.apply('link', value, anchor);
 				}
 			},
-			
+
 			selectAll : function() {
 				var root = dom.getRoot(), rng = dom.createRng();
 
@@ -511,7 +517,14 @@
 		addCommands({
 			// Override justify commands
 			'JustifyLeft,JustifyCenter,JustifyRight,JustifyFull' : function(command) {
-				return isFormatMatch('align' + command.substring(7));
+				var name = 'align' + command.substring(7);
+				// Use Formatter.matchNode instead of Formatter.match so that we don't match on parent node. This fixes bug where for both left
+				// and right align buttons can be active. This could occur when selected nodes have align right and the parent has align left.
+				var nodes = selection.isCollapsed() ? [selection.getNode()] : selection.getSelectedBlocks();
+				var matches = tinymce.map(nodes, function(node) {
+					return !!formatter.matchNode(node, name);
+				});
+				return tinymce.inArray(matches, TRUE) !== -1;
 			},
 
 			'Bold,Italic,Underline,Strikethrough,Superscript,Subscript' : function(command) {
